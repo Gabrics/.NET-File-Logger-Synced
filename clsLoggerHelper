@@ -1,0 +1,142 @@
+    // By: Gabor Riesz 2016, for my onw usage and fun ;)
+    // The goal of this class:
+    // Provide a way of logging which works from many concurrent threads AND PROCESSES (like IIS workers)
+    // How to use:
+    // 1. Instantiate this calls preferrebly ONCE process level
+    // 2. Call the QueueLogToFile function in this class with FULL PATH and LogMsg string
+    // 3. This class queues the request and writes out the logs after iMaxQCountBeforeForcedWrite in queue 
+    //    or iMaxSecondsBeforeForcedWrite 
+    // Known limitations:
+    // Sync is done by the logging MUTEX name. Not by filename! (looks good enough for my usage)
+    
+    public class clsLoggerHelper:IDisposable
+    {
+        //These are the ones you should!!! modify to avoid locking each other's logger
+        private static string m_sMutexName = @"Global\WebmailLoggerMutex";
+
+        //These are the ones you CAN modify 
+        private static int iMaxQCountBeforeForcedWrite = 10;
+        private static int iMaxSecondsBeforeForcedWrite = 10;
+
+        private static Mutex m_Mutex;
+        private static ConcurrentQueue<struLog> m_qToLog = new ConcurrentQueue<struLog>();
+        private static DateTime m_dLastFileWritten=DateTime.Now;
+        private static bool m_blIOwnMutex;
+        private System.Timers.Timer m_trmWriteOut;
+
+        public clsLoggerHelper()
+        {   
+            bool blMutexExists=Mutex.TryOpenExisting(m_sMutexName, out m_Mutex);
+            if (blMutexExists == false)
+            {
+                m_Mutex = new Mutex(false, m_sMutexName);
+                var allowEveryoneRule = new MutexAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), MutexRights.FullControl, AccessControlType.Allow);
+                var securitySettings = new MutexSecurity();
+                securitySettings.AddAccessRule(allowEveryoneRule);
+                m_Mutex.SetAccessControl(securitySettings);
+            }
+            else
+            {   //Existing MUTEX
+
+            }
+
+            m_trmWriteOut = new System.Timers.Timer();
+            m_trmWriteOut.Elapsed += new ElapsedEventHandler(OnTimedWriteOutEvent);
+            m_trmWriteOut.Interval = iMaxQCountBeforeForcedWrite*1000;
+            m_trmWriteOut.Enabled = true;
+        }
+
+        public void QueueLogToFile(string sPath,string sLogMsg)
+        {
+            struLog log = new struLog();
+            log.sFilePath = sPath;
+            log.sLogLine = sLogMsg;
+            m_qToLog.Enqueue(log);
+
+            if ((m_qToLog.Count> iMaxQCountBeforeForcedWrite) || (m_dLastFileWritten.AddSeconds(iMaxSecondsBeforeForcedWrite)<DateTime.Now))
+            {
+                WriteQueue(500);
+            }
+        }
+        private static void OnTimedWriteOutEvent(object source, ElapsedEventArgs e)
+        {
+            if ((m_qToLog.Count>0) && (m_dLastFileWritten.AddSeconds(iMaxSecondsBeforeForcedWrite) < DateTime.Now))
+            {
+                WriteQueue(500);
+            }
+        }
+        private static void WriteQueue(int iWaitTimeout)
+        {   //This is globally sync-ed by MUTEX
+            try
+            {
+                if (iWaitTimeout <= 0)
+                    m_blIOwnMutex = m_Mutex.WaitOne(Timeout.Infinite, false);
+                else
+                    m_blIOwnMutex = m_Mutex.WaitOne(iWaitTimeout, false);
+
+                if (m_blIOwnMutex == true)
+                {   //Write the logs
+                    m_dLastFileWritten = DateTime.Now;
+
+                    try
+                    {
+                        struLog log;
+                        bool blSuccess;
+                        while (m_qToLog.Count>0)
+                        {
+                            blSuccess = m_qToLog.TryDequeue(out log);
+                            if (blSuccess==true)
+                            {
+                                //log.sFilePath = @"d:\0\TestLog.txt";
+                                using (StreamWriter sw = new StreamWriter(log.sFilePath, true))
+                                {
+                                    sw.WriteLine(log.sLogLine);
+                                    sw.Close();
+                                }
+                            }
+
+                        }
+
+                    }
+                    catch(Exception e)
+                    {
+                        throw (e);
+                    }
+                    finally
+                    {
+                        m_Mutex.ReleaseMutex();
+                    }
+
+                }
+
+            }
+            catch (AbandonedMutexException)
+            {
+            }
+        }
+
+        public void Dispose()
+        {
+
+            if (m_Mutex != null)
+            {
+                if (m_qToLog.Count > 0)
+                {   //Wait long to write out everything
+                    WriteQueue(10000);
+                }
+                DateTime dWaitStart = DateTime.Now;
+                while (m_blIOwnMutex==true)
+                {   //Wait until owned mutex released
+                    if (dWaitStart.AddSeconds(5) > DateTime.Now)
+                        throw (new Exception("Logger MUTEX was not released in five seconds!"));
+                    Thread.Sleep(50);
+                }
+                m_Mutex.Dispose();
+            }
+        }
+        private struct struLog
+        {
+            public string sFilePath;
+            public string sLogLine;
+        }
+    }
