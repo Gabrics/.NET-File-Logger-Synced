@@ -1,15 +1,17 @@
-    // By: Gabor Riesz 2016, for my onw usage and fun ;)
+    // By: Gabor Riesz 2016, for my own usage and fun ;)
     // The goal of this class:
     // Provide a way of logging which works from many concurrent threads AND PROCESSES (like IIS workers)
+
     // How to use:
-    // 1. Instantiate this calls preferrebly ONCE process level
-    // 2. Call the QueueLogToFile function in this class with FULL PATH and LogMsg string
-    // 3. This class queues the request and writes out the logs after iMaxQCountBeforeForcedWrite in queue 
-    //    or iMaxSecondsBeforeForcedWrite 
+    // 1. Rename m_sMutexName to something works for you code ("Global\" has to stay at the beginning!)
+    // 2. Instantiate this calls preferrebly ONCE on the process level (you can create more, it should work fine but will waste threads and resources)
+    // 3. Call the QueueLogToFile function in this class with FULL PATH and LogMsg string
+    // 4. This class queues the request and writes out the logs after iMaxQCountBeforeForcedWrite in queue or iMaxSecondsBeforeForcedWrite or blForced is set
+
     // Known limitations:
     // Sync is done by the logging MUTEX name. Not by filename! (looks good enough for my usage)
-    // File writes are organized in FIFO order not by file (could cause big performance increase, possible future improvement)
-    
+    // File writes are organized in FIFO order not by file (could cause performance increase but would make the code more complex and hence this is an error logger that is bad IMHO, possible future improvement)
+
     public class clsLoggerHelper:IDisposable
     {
         //These are the ones you should!!! modify to avoid locking each other's logger
@@ -21,10 +23,11 @@
 
         private static Mutex m_Mutex;
         private static ConcurrentQueue<struLog> m_qToLog = new ConcurrentQueue<struLog>();
+        private static bool m_blForceFlush = false;
         private static DateTime m_dLastFileWritten=DateTime.Now;
         private static bool m_blIOwnMutex;
-        private System.Timers.Timer m_trmWriteOut;
-
+        private static Thread m_threadFileWriter;
+        private static bool m_blExiting = false;
         public clsLoggerHelper()
         {   
             bool blMutexExists=Mutex.TryOpenExisting(m_sMutexName, out m_Mutex);
@@ -36,95 +39,103 @@
                 securitySettings.AddAccessRule(allowEveryoneRule);
                 m_Mutex.SetAccessControl(securitySettings);
             }
-            else
-            {   //Existing MUTEX
 
-            }
-
-            m_trmWriteOut = new System.Timers.Timer();
-            m_trmWriteOut.Elapsed += new ElapsedEventHandler(OnTimedWriteOutEvent);
-            m_trmWriteOut.Interval = iMaxQCountBeforeForcedWrite*1000;
-            m_trmWriteOut.Enabled = true;
+            m_threadFileWriter = new Thread(new ThreadStart(WriteQueue));
+            m_threadFileWriter.Start();
         }
 
-        public void QueueLogToFile(string sPath,string sLogMsg)
+        public void QueueLogToFile(string sPath, string sLogMsg,bool blForceFlush=false)
         {
             struLog log = new struLog();
             log.sFilePath = sPath;
             log.sLogLine = sLogMsg;
             m_qToLog.Enqueue(log);
+            if (blForceFlush == true)
+                m_blForceFlush = true;
 
-            if ((m_qToLog.Count> iMaxQCountBeforeForcedWrite) || (m_dLastFileWritten.AddSeconds(iMaxSecondsBeforeForcedWrite)<DateTime.Now))
-            {
-                WriteQueue(500);
-            }
         }
-        private static void OnTimedWriteOutEvent(object source, ElapsedEventArgs e)
+        private static void WriteQueue()
         {
-            if ((m_qToLog.Count>0) && (m_dLastFileWritten.AddSeconds(iMaxSecondsBeforeForcedWrite) < DateTime.Now))
+            int iMutexFailedToObtainCounter = 0;
+            while ((m_blExiting == false) || (m_qToLog.Count>0))
             {
-                WriteQueue(500);
-            }
-        }
-        private static void WriteQueue(int iWaitTimeout)
-        {   //This is globally sync-ed by MUTEX
-            try
-            {
-                if (iWaitTimeout <= 0)
-                    m_blIOwnMutex = m_Mutex.WaitOne(Timeout.Infinite, false);
-                else
-                    m_blIOwnMutex = m_Mutex.WaitOne(iWaitTimeout, false);
-
-                if (m_blIOwnMutex == true)
-                {   //Write the logs
-                    m_dLastFileWritten = DateTime.Now;
-
+                if ((m_qToLog.Count > iMaxQCountBeforeForcedWrite) || (m_dLastFileWritten.AddSeconds(iMaxSecondsBeforeForcedWrite) < DateTime.Now) || (m_blForceFlush == true))
+                {   
                     try
                     {
-                        struLog log;
-                        bool blSuccess;
-                        while (m_qToLog.Count>0)
-                        {
-                            blSuccess = m_qToLog.TryDequeue(out log);
-                            if (blSuccess==true)
+                        m_blIOwnMutex = m_Mutex.WaitOne(100, false);
+                        //Inside this if is machine-wide sync-ed if MUTEX optained
+                        if (m_blIOwnMutex == true)
+                        {   
+                            try
                             {
-                                //log.sFilePath = @"d:\0\TestLog.txt";
-                                using (StreamWriter sw = new StreamWriter(log.sFilePath, true))
-                                {
-                                    sw.WriteLine(log.sLogLine);
-                                    sw.Close();
+                                m_dLastFileWritten = DateTime.Now;
+                                m_blForceFlush = false;
+                                struLog log;
+                                bool blSuccess;
+                                while (m_qToLog.Count > 0)
+                                {   // Write out all the logs
+                                    blSuccess = m_qToLog.TryDequeue(out log);
+                                    if (blSuccess == true)
+                                    {
+                                        //Re-route all outputs to one file to see if it is really working (it does).
+                                        //log.sFilePath = @"d:\0\TestLog.txt"; //Debug!!!!
+                                        using (StreamWriter sw = new StreamWriter(log.sFilePath, true))
+                                        {
+                                            sw.WriteLine(log.sLogLine);
+                                            sw.Close();
+                                        }
+                                    }
                                 }
+
+                            }
+                            catch (Exception e)
+                            {   //Try to log writer thread exception locally to a file
+                                string sErrorLogPath = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)+"clsLoggerHelper_"+DateTime.Now.ToString("yyyyMMddHHmmss") + ".txt";
+
+                                string sMsg = $"{DateTime.Now.ToString("yyyy/MM/dd HH:mm:ss:")}{DateTime.Now.Millisecond.ToString("0##")}|{e.Message} |Caller:clsLoggerHelper.WriteQueue";
+                                Console.WriteLine(sMsg);
+                                try
+                                {
+                                    using (StreamWriter sw = new StreamWriter(sErrorLogPath, true))
+                                    {
+                                        sw.WriteLine(sMsg);
+                                        sw.Close();
+                                    }
+                                }
+                                catch(Exception exInner)
+                                {   //Just display the message if there is an error inside the error handler logging
+                                    Console.WriteLine("Couldn't log error inside the error logger:"+exInner.Message);
+                                }
+
+                            }
+                            finally
+                            {
+                                m_Mutex.ReleaseMutex();
                             }
 
                         }
+                        else
+                        {
+                            iMutexFailedToObtainCounter++;
+                        }
 
                     }
-                    catch(Exception e)
+                    catch (AbandonedMutexException)
                     {
-                        throw (e);
                     }
-                    finally
-                    {
-                        m_Mutex.ReleaseMutex();
-                    }
-
                 }
+                Thread.Sleep(100);
+            }
 
-            }
-            catch (AbandonedMutexException)
-            {
-            }
+
         }
 
         public void Dispose()
         {
-
+            m_blExiting = true;
             if (m_Mutex != null)
             {
-                if (m_qToLog.Count > 0)
-                {   //Wait long to write out everything
-                    WriteQueue(10000);
-                }
                 DateTime dWaitStart = DateTime.Now;
                 while (m_blIOwnMutex==true)
                 {   //Wait until owned mutex released
