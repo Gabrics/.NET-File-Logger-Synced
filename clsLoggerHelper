@@ -8,6 +8,7 @@
     //    or iMaxSecondsBeforeForcedWrite 
     // Known limitations:
     // Sync is done by the logging MUTEX name. Not by filename! (looks good enough for my usage)
+    // File writes are organized in FIFO order not by file (could cause big performance increase, possible future improvement)
     
     public class clsLoggerHelper:IDisposable
     {
